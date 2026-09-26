@@ -1,0 +1,811 @@
+#!/usr/bin/env python3
+
+import base64
+import json
+import os
+from pathlib import Path
+import re
+import selectors
+import shutil
+import stat
+import subprocess
+import sys
+import time
+
+
+HELPER_PROTOCOL = 1
+CONTRACT = "clay-search/1"
+INPUT_BYTES = 1 << 20
+RESULT_BYTES = 512 << 10
+MATCH_TEXT_BYTES = 4 << 10
+QUERY_BYTES = 4 << 10
+TOOL_RECORD_HEAD_BYTES = 16 << 10
+TOOL_RECORD_AFTER_LINES_BYTES = 32 << 10
+TOOL_PATH_BYTES = 64 << 10
+TOOL_ERROR_BYTES = 8 << 10
+TOOL_TIMEOUT_SECONDS = 285
+
+RESULT_SUFFIX_COMPLETE = b'],"truncated":false}}'
+RESULT_SUFFIX_TRUNCATED = b'],"truncated":true}}'
+
+FILE_KINDS = {
+    "images": ("svg", "png", "jpg", "jpeg", "gif", "webp", "avif", "heic", "heif", "bmp", "tif", "tiff", "ico", "cr2", "cr3", "nef", "arw", "dng", "raf", "orf", "rw2"),
+    "video": ("mp4", "mov", "m4v", "mkv", "webm", "avi", "mpg", "mpeg", "wmv"),
+    "audio": ("mp3", "wav", "aif", "aiff", "m4a", "aac", "flac", "ogg", "oga", "opus", "wma", "caf", "mid", "midi"),
+    "documents": ("doc", "docx", "pdf", "odt", "rtf", "txt", "md", "pages"),
+    "data": ("xls", "xlsx", "numbers", "ods", "csv", "tsv", "json", "jsonl", "xml", "yaml", "yml", "sqlite", "sqlite3", "db", "parquet"),
+    "presentations": ("key", "ppt", "pptx", "odp"),
+    "code": ("js", "mjs", "cjs", "ts", "tsx", "jsx", "py", "go", "rs", "rb", "php", "java", "swift", "c", "h", "cpp", "sh", "zsh", "css", "scss", "html", "htmlclay", "vue", "svelte", "sql"),
+    "fonts": ("ttf", "otf", "woff", "woff2"),
+    "archives": ("zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar", "dmg", "pkg", "iso"),
+}
+
+
+class SearchError(Exception):
+    def __init__(self, code, message, details=None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details
+
+
+class DuplicateKeyError(ValueError):
+    pass
+
+
+def object_without_duplicates(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise DuplicateKeyError(key)
+        value[key] = item
+    return value
+
+
+def json_bytes(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def emit(value):
+    sys.stdout.buffer.write(json_bytes(value) + b"\n")
+    sys.stdout.buffer.flush()
+
+
+def emit_error(error):
+    record = {"type": "error", "code": error.code, "message": error.message}
+    if error.details is not None:
+        record["details"] = error.details
+    emit(record)
+
+
+def read_request():
+    raw = sys.stdin.buffer.read(INPUT_BYTES + 1)
+    if len(raw) > INPUT_BYTES:
+        raise SearchError("invalid_request", "Request is too large", {"limit": INPUT_BYTES})
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise SearchError("invalid_request", "Request is not valid UTF-8") from None
+    try:
+        request = json.loads(text, object_pairs_hook=object_without_duplicates)
+    except DuplicateKeyError as error:
+        raise SearchError("invalid_request", "Request contains a duplicate key", {"field": str(error)}) from None
+    except json.JSONDecodeError:
+        raise SearchError("invalid_request", "Request is not valid JSON") from None
+    if not isinstance(request, dict):
+        raise SearchError("invalid_request", "Request must be a JSON object")
+    return request
+
+
+def descriptor():
+    return {
+        "helperProtocol": HELPER_PROTOCOL,
+        "contract": CONTRACT,
+        "operations": ["search", "scopes", "chooseFolder", "reveal"],
+        "search": {
+            "required": ["op", "query"],
+            "optional": ["scope", "root", "mode", "fileType", "fileKind"],
+            "scopes": [s["key"] for s in available_scopes()],
+            "defaultScope": DEFAULT_SCOPE,
+            "modes": ["name", "contents"],
+            "fileKinds": FILE_KINDS,
+            "match": {
+                "path": "scope-relative path",
+                "line": "one-based line number for contents matches",
+                "text": "bounded line text for contents matches",
+                "textTruncated": "whether bounded line text was shortened",
+            },
+        },
+        "limits": {
+            "resultBytes": RESULT_BYTES,
+            "matchTextBytes": MATCH_TEXT_BYTES,
+            "queryBytes": QUERY_BYTES,
+            "deadlineMs": TOOL_TIMEOUT_SECONDS * 1000,
+        },
+    }
+
+
+def require_string(payload, field, maximum, allow_empty=False):
+    value = payload.get(field)
+    if not isinstance(value, str) or (not allow_empty and not value):
+        raise SearchError("invalid_request", f"{field} must be a nonempty string", {"field": field})
+    if "\0" in value:
+        raise SearchError("invalid_request", f"{field} contains a null byte", {"field": field})
+    if len(value.encode("utf-8")) > maximum:
+        raise SearchError("invalid_request", f"{field} is too large", {"field": field, "limit": maximum})
+    return value
+
+
+def request_payload(request):
+    protocol = request.get("helperProtocol")
+    if protocol is not None and protocol != HELPER_PROTOCOL:
+        raise SearchError("unsupported_protocol", "Unsupported helper protocol", {"helperProtocol": protocol})
+    if request.get("type") != "wire/request" or not isinstance(request.get("payload"), dict):
+        raise SearchError("invalid_request", "Expected a wire request with an object payload")
+    return request["payload"]
+
+
+def resolve_root(value):
+    value = require_string({"root": value}, "root", TOOL_PATH_BYTES)
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise SearchError("invalid_request", "Use an absolute folder path or a ~/ path", {"field": "root"})
+    try:
+        root = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise SearchError("scope_unavailable", "That folder does not exist", {"root": value}) from None
+    if not root.is_dir() or not os.access(root, os.R_OK | os.X_OK):
+        raise SearchError("scope_unavailable", "That path is not a readable folder", {"root": value})
+    return root
+
+
+def selected_root(payload):
+    if "root" in payload:
+        if "scope" in payload:
+            raise SearchError("invalid_request", "Choose either root or scope")
+        return None, resolve_root(payload["root"])
+    scope_key = payload.get("scope", DEFAULT_SCOPE)
+    if not isinstance(scope_key, str):
+        raise SearchError("invalid_request", "scope must be a string", {"field": "scope"})
+    return scope_key, resolve_scope(scope_key)
+
+
+def file_extensions(payload):
+    kind = payload.get("fileKind")
+    extension = payload.get("fileType")
+    if kind not in (None, "", "all"):
+        if not isinstance(kind, str) or kind not in FILE_KINDS:
+            raise SearchError("invalid_request", "Unknown file category", {"field": "fileKind"})
+        if extension not in (None, ""):
+            raise SearchError("invalid_request", "Choose a category or a custom extension")
+        return FILE_KINDS[kind]
+    if extension in (None, ""):
+        return ()
+    if not isinstance(extension, str):
+        raise SearchError("invalid_request", "fileType must be a string", {"field": "fileType"})
+    extension = extension.removeprefix(".")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}", extension):
+        raise SearchError("invalid_request", "fileType is not a valid extension", {"field": "fileType"})
+    return (extension.lower(),)
+
+
+def is_cloud_root(root):
+    cloud_roots = [Path.home() / "Library/CloudStorage", Path.home() / "Library/Mobile Documents", Path.home() / "Dropbox"]
+    for path in cloud_roots:
+        try:
+            cloud = path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if root == cloud or cloud in root.parents or root in cloud.parents:
+            return True
+    return False
+
+
+def choose_folder():
+    script = 'activate me\nPOSIX path of (choose folder with prompt "Choose a folder to search")'
+    try:
+        result = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        raise SearchError("folder_picker_failed", "The folder picker could not complete") from None
+    if result.returncode:
+        if "(-128)" in result.stderr:
+            return {"cancelled": True}
+        raise SearchError("folder_picker_failed", "The folder picker could not open")
+    return {"root": str(resolve_root(result.stdout.rstrip("\n"))), "cancelled": False}
+
+
+def reveal_file(payload):
+    _, root = selected_root(payload)
+    path = require_string(payload, "path", TOOL_PATH_BYTES)
+    if Path(path).is_absolute():
+        raise SearchError("invalid_request", "The result path must be relative to its search folder")
+    confined = confined_path(root, path)
+    if confined is None:
+        raise SearchError("file_unavailable", "That file no longer exists")
+    resolved, _ = confined
+    try:
+        subprocess.run(["/usr/bin/open", "-R", str(resolved)], check=True, capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        raise SearchError("reveal_failed", "Finder could not reveal that file") from None
+    return {"revealed": True}
+
+
+def parse_search_request(request):
+    payload = request_payload(request)
+    if payload.get("op") != "search":
+        raise SearchError("unsupported_operation", "Unsupported operation", {"op": payload.get("op")})
+    mode = payload.get("mode", "contents")
+    if mode not in ("name", "contents"):
+        raise SearchError("invalid_request", "mode must be name or contents", {"field": "mode"})
+    query = require_string(payload, "query", QUERY_BYTES, allow_empty=mode == "name")
+    extensions = file_extensions(payload)
+    scope_key, root = selected_root(payload)
+    return scope_key, root, scope_excludes(root), query, mode, extensions
+
+
+SCOPES = (
+    ("github", "GitHub", "Documents/GitHub"),
+    ("hyperclay", "Hyperclay", "Documents/GitHub/hyper/hyperclay"),
+    ("plans", "Plans", "Documents/GitHub/hyper/plans"),
+    ("documents", "Documents", "Documents"),
+    ("downloads", "Downloads", "Downloads"),
+    ("dropbox", "Dropbox Current", "Library/CloudStorage/Dropbox/_Current"),
+    ("polsia", "Polsia research", "Documents/GitHub/polsia/polsia-research"),
+)
+DEFAULT_SCOPE = "github"
+
+# Folders a sync client fills on demand. Reading a placeholder makes it download
+# the file, so a contents search over one of these pulls the whole folder down
+# and times out. Filename search never opens a file and is unaffected.
+CLOUD_SCOPES = ("dropbox",)
+SF_DATALESS = 0x40000000
+LOCAL_LIST_BYTES = 800 << 10
+LOCAL_LIST_COUNT = 20000
+
+# polsia-research holds 695k of the 805k files under Documents/GitHub, which is
+# the difference between a 3 second search and a 33 second one. It is skipped
+# everywhere rather than searched, and reachable as its own scope rather than
+# hidden, so nothing is silently missing.
+EXCLUDED = ("Documents/GitHub/polsia/polsia-research",)
+
+
+def scope_table():
+    return {key: (label, relative) for key, label, relative in SCOPES}
+
+
+def resolve_scope(key):
+    """Resolve an existing named shortcut to a folder on disk."""
+    entry = scope_table().get(key)
+    if entry is None:
+        raise SearchError("unknown_scope", "Unknown search scope", {"scope": key, "known": [k for k, _, _ in SCOPES]})
+    label, relative = entry
+    try:
+        root = (Path.home() / relative).resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise SearchError("scope_unavailable", f"{label} is not on this machine", {"scope": key}) from None
+    if not root.is_dir():
+        raise SearchError("scope_unavailable", f"{label} is not a folder", {"scope": key})
+    return root
+
+
+def scope_excludes(root):
+    """Paths to skip, relative to the scope root, for the tools to glob out.
+
+    Strict containment, so selecting an excluded folder as its own scope still
+    searches it instead of excluding everything.
+    """
+    out = []
+    for relative in EXCLUDED:
+        try:
+            path = (Path.home() / relative).resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if root in path.parents:
+            out.append(str(path.relative_to(root)))
+    return out
+
+
+def available_scopes():
+    out = []
+    for key, label, relative in SCOPES:
+        path = Path.home() / relative
+        out.append({
+            "key": key,
+            "label": label,
+            "available": path.is_dir(),
+            "path": str(path.resolve()),
+            "cloud": key in CLOUD_SCOPES,
+        })
+    return out
+
+
+def local_files(root):
+    """The files under a cloud folder that are already on this Mac.
+
+    macOS marks a not yet downloaded placeholder with SF_DATALESS. That flag is
+    the one to trust: st_blocks agrees on all but a handful of files, and the
+    handful is the point of checking. Returns the paths to search and how many
+    were left out, so the page can say what it skipped instead of quietly
+    returning less than the folder holds.
+    """
+    kept = []
+    skipped = 0
+    used = 0
+    for base, _, names in os.walk(root):
+        for name in names:
+            path = os.path.join(base, name)
+            try:
+                info = os.lstat(path)
+            except OSError:
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            if info.st_flags & SF_DATALESS:
+                skipped += 1
+                continue
+            if len(kept) >= LOCAL_LIST_COUNT or used + len(path) + 1 > LOCAL_LIST_BYTES:
+                skipped += 1
+                continue
+            kept.append(path)
+            used += len(path) + 1
+    return kept, skipped
+
+
+def find_tool(name):
+    path = shutil.which(name)
+    if path is None:
+        raise SearchError("tool_unavailable", f"{name} is not installed", {"tool": name})
+    return str(Path(path).resolve())
+
+
+def decoded_rg_value(value):
+    if not isinstance(value, dict):
+        raise SearchError("search_failed", "Search tool returned an invalid value")
+    text = value.get("text")
+    if isinstance(text, str):
+        return text.encode("utf-8")
+    encoded = value.get("bytes")
+    if isinstance(encoded, str):
+        try:
+            return base64.b64decode(encoded, validate=True)
+        except ValueError:
+            pass
+    raise SearchError("search_failed", "Search tool returned invalid text")
+
+
+def decoded_rg_path(value):
+    raw = decoded_rg_value(value)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise SearchError("search_failed", "Search tool returned a non-UTF-8 path") from None
+
+
+def confined_path(root, raw_path):
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    try:
+        relative = resolved.relative_to(root)
+    except ValueError:
+        raise SearchError(
+            "path_outside_root",
+            "Search tool returned a path outside the search folder",
+            {"root": str(root), "path": raw_path},
+        ) from None
+    if not resolved.is_file():
+        return None
+    return resolved, relative.as_posix()
+
+
+def bounded_text(raw):
+    if raw.endswith(b"\n"):
+        raw = raw[:-1]
+    if raw.endswith(b"\r"):
+        raw = raw[:-1]
+    text = raw.decode("utf-8", errors="replace")
+    encoded = text.encode("utf-8")
+    truncated = len(encoded) > MATCH_TEXT_BYTES
+    if truncated:
+        text = encoded[:MATCH_TEXT_BYTES].decode("utf-8", errors="ignore")
+    return text, truncated
+
+
+def read_line_from_file(path, line_number, deadline):
+    current = 1
+    line = bytearray()
+    truncated = False
+    try:
+        with path.open("rb") as source:
+            while True:
+                if time.monotonic() >= deadline:
+                    raise SearchError("search_timeout", "Search timed out")
+                chunk = source.read(64 << 10)
+                if not chunk:
+                    break
+                start = 0
+                while start < len(chunk):
+                    newline = chunk.find(b"\n", start)
+                    end = len(chunk) if newline < 0 else newline + 1
+                    if current == line_number:
+                        available = MATCH_TEXT_BYTES + 2 - len(line)
+                        if available > 0:
+                            line.extend(chunk[start:end][:available])
+                        if end - start > available:
+                            truncated = True
+                    if newline < 0:
+                        break
+                    if current == line_number:
+                        text, capped = bounded_text(bytes(line))
+                        return text, truncated or capped
+                    current += 1
+                    start = end
+            if current == line_number:
+                text, capped = bounded_text(bytes(line))
+                return text, truncated or capped
+    except OSError:
+        return "", True
+    return "", True
+
+
+class ResultBuilder:
+    def __init__(self, root):
+        self.hits = []
+        self.prefix = b'{"type":"result","value":{"root":' + json_bytes(str(root)) + b',"matches":['
+        self.size = len(self.prefix) + len(RESULT_SUFFIX_COMPLETE)
+        self.truncated = False
+
+    def add(self, hit):
+        encoded = json_bytes(hit)
+        addition = len(encoded) + (1 if self.hits else 0)
+        if self.size + addition > RESULT_BYTES:
+            self.truncated = True
+            return False
+        self.hits.append(encoded)
+        self.size += addition
+        return True
+
+    def record(self):
+        suffix = RESULT_SUFFIX_TRUNCATED if self.truncated else RESULT_SUFFIX_COMPLETE
+        record = self.prefix + b",".join(self.hits) + suffix
+        if len(record) > RESULT_BYTES:
+            raise RuntimeError("result record exceeded its byte limit")
+        return record
+
+
+class NameParser:
+    def __init__(self, root, results):
+        self.root = root
+        self.results = results
+        self.pending = bytearray()
+        self.stopped = False
+
+    def feed(self, chunk):
+        if self.stopped:
+            return
+        self.pending.extend(chunk)
+        if len(self.pending) > TOOL_PATH_BYTES and b"\0" not in self.pending:
+            raise SearchError("search_failed", "Search tool returned an oversized path")
+        while True:
+            boundary = self.pending.find(0)
+            if boundary < 0:
+                return
+            raw = bytes(self.pending[:boundary])
+            del self.pending[: boundary + 1]
+            try:
+                path_text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            confined = confined_path(self.root, path_text)
+            if confined is None:
+                continue
+            _, relative = confined
+            if not self.results.add({"path": relative}):
+                self.stopped = True
+                return
+
+    def finish(self):
+        if self.pending:
+            raise SearchError("search_failed", "Search tool returned an unterminated path")
+
+
+class RgLine:
+    TEXT_MARKER = b'"lines":{"text":"'
+    BYTES_MARKER = b'"lines":{"bytes":"'
+
+    def __init__(self):
+        self.total = 0
+        self.head = bytearray()
+        self.marker_kind = None
+        self.scanned = 0
+        self.escaped = False
+        self.lines_ended = False
+        self.after_lines = bytearray()
+
+    def feed(self, data):
+        prior_total = self.total
+        self.total += len(data)
+        remaining = TOOL_RECORD_HEAD_BYTES - len(self.head)
+        if remaining > 0:
+            self.head.extend(data[:remaining])
+        if self.marker_kind is None:
+            positions = []
+            for kind, marker in (("text", self.TEXT_MARKER), ("bytes", self.BYTES_MARKER)):
+                position = self.head.find(marker)
+                if position >= 0:
+                    positions.append((position, kind, marker))
+            if positions:
+                position, self.marker_kind, marker = min(positions)
+                marker_end = position + len(marker)
+                self._scan(bytes(self.head[marker_end:]))
+                self.scanned = len(self.head)
+        if self.marker_kind is not None and self.scanned < self.total:
+            offset = max(self.scanned, prior_total) - prior_total
+            self._scan(data[offset:])
+            self.scanned = self.total
+
+    def _scan(self, data):
+        if self.lines_ended:
+            remaining = TOOL_RECORD_AFTER_LINES_BYTES - len(self.after_lines)
+            if remaining > 0:
+                self.after_lines.extend(data[:remaining])
+            return
+        for index, byte in enumerate(data):
+            if self.escaped:
+                self.escaped = False
+            elif byte == 92:
+                self.escaped = True
+            elif byte == 34:
+                self.lines_ended = True
+                remaining = TOOL_RECORD_AFTER_LINES_BYTES - len(self.after_lines)
+                if remaining > 0:
+                    self.after_lines.extend(data[index + 1 : index + 1 + remaining])
+                return
+
+
+class ContentsParser:
+    def __init__(self, root, results, deadline):
+        self.root = root
+        self.results = results
+        self.deadline = deadline
+        self.line = RgLine()
+        self.stopped = False
+
+    def feed(self, chunk):
+        if self.stopped:
+            return
+        start = 0
+        while start < len(chunk):
+            boundary = chunk.find(b"\n", start)
+            if boundary < 0:
+                self.line.feed(chunk[start:])
+                return
+            self.line.feed(chunk[start:boundary])
+            self._finish_line()
+            if self.stopped:
+                return
+            self.line = RgLine()
+            start = boundary + 1
+
+    def finish(self):
+        if self.line.total:
+            self._finish_line()
+
+    def _finish_line(self):
+        if self.line.total == 0:
+            raise SearchError("search_failed", "Search tool returned a blank record")
+        if self.line.total <= TOOL_RECORD_HEAD_BYTES:
+            try:
+                record = json.loads(bytes(self.line.head).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise SearchError("search_failed", "Search tool returned invalid JSON") from None
+            self._handle_record(record)
+            return
+        self._handle_oversized_match()
+
+    def _handle_record(self, record):
+        if not isinstance(record, dict):
+            raise SearchError("search_failed", "Search tool returned a non-object record")
+        record_type = record.get("type")
+        if record_type in ("begin", "end", "summary"):
+            return
+        if record_type != "match":
+            raise SearchError("search_failed", "Search tool returned an unknown record type")
+        data = record.get("data")
+        if not isinstance(data, dict):
+            raise SearchError("search_failed", "Search tool returned invalid match data")
+        path_text = decoded_rg_path(data.get("path"))
+        line_number = data.get("line_number")
+        if not isinstance(line_number, int) or isinstance(line_number, bool) or line_number < 1:
+            raise SearchError("search_failed", "Search tool returned an invalid line number")
+        confined = confined_path(self.root, path_text)
+        if confined is None:
+            return
+        _, relative = confined
+        raw_text = decoded_rg_value(data.get("lines"))
+        text, text_truncated = bounded_text(raw_text)
+        self._add(relative, line_number, text, text_truncated)
+
+    def _handle_oversized_match(self):
+        head = bytes(self.line.head)
+        if b'"type":"match"' not in head or self.line.marker_kind is None or not self.line.lines_ended:
+            raise SearchError("search_failed", "Search tool returned an oversized invalid record")
+        path_start = head.find(b'"path":')
+        lines_start = head.find(b',"lines":', path_start)
+        if path_start < 0 or lines_start < 0:
+            raise SearchError("search_failed", "Search tool returned an oversized invalid match")
+        try:
+            path_value = json.loads(head[path_start + len(b'"path":') : lines_start].decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise SearchError("search_failed", "Search tool returned an invalid path") from None
+        match = re.search(rb'\},"line_number":([0-9]+|null),', bytes(self.line.after_lines))
+        if match is None or match.group(1) == b"null":
+            raise SearchError("search_failed", "Search tool returned an invalid line number")
+        path_text = decoded_rg_path(path_value)
+        line_number = int(match.group(1))
+        confined = confined_path(self.root, path_text)
+        if confined is None:
+            return
+        resolved, relative = confined
+        text, _ = read_line_from_file(resolved, line_number, self.deadline)
+        self._add(relative, line_number, text, True)
+
+    def _add(self, relative, line_number, text, text_truncated):
+        hit = {"path": relative, "line": line_number, "text": text}
+        if text_truncated:
+            hit["textTruncated"] = True
+        if not self.results.add(hit):
+            self.stopped = True
+
+
+def stop_process(process):
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+    if process.stdout is not None:
+        process.stdout.close()
+    if process.stderr is not None:
+        process.stderr.close()
+
+
+def run_tool(arguments, parser, deadline):
+    try:
+        process = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as error:
+        raise SearchError("tool_unavailable", "Search tool could not start", {"error": str(error)}) from None
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    diagnostics = bytearray()
+    stopped = False
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SearchError("search_timeout", "Search timed out")
+            events = selector.select(min(remaining, 0.25))
+            if not events:
+                continue
+            for key, _ in events:
+                chunk = os.read(key.fileobj.fileno(), 64 << 10)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    if key.data == "stdout":
+                        parser.finish()
+                    continue
+                if key.data == "stdout":
+                    parser.feed(chunk)
+                    if parser.stopped:
+                        stopped = True
+                        break
+                else:
+                    remaining_error = TOOL_ERROR_BYTES - len(diagnostics)
+                    if remaining_error > 0:
+                        diagnostics.extend(chunk[:remaining_error])
+            if stopped:
+                break
+        if stopped:
+            stop_process(process)
+            return 0, "", True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SearchError("search_timeout", "Search timed out")
+        return_code = process.wait(timeout=remaining)
+        return return_code, diagnostics.decode("utf-8", errors="replace").strip(), False
+    except subprocess.TimeoutExpired:
+        raise SearchError("search_timeout", "Search timed out") from None
+    finally:
+        selector.close()
+        stop_process(process)
+
+
+def search(root, excludes, targets, query, mode, extensions):
+    results = ResultBuilder(root)
+    deadline = time.monotonic() + TOOL_TIMEOUT_SECONDS
+    if mode == "name":
+        arguments = [find_tool("fd"), "--type", "file", "--absolute-path", "--print0", "--fixed-strings"]
+        for skip in excludes:
+            arguments.extend(("--exclude", f"**/{skip}/**"))
+        for extension in extensions:
+            arguments.extend(("--extension", extension))
+        arguments.extend(("--", query, *targets))
+        parser = NameParser(root, results)
+        return_code, diagnostics, stopped = run_tool(arguments, parser, deadline)
+        if not stopped and return_code != 0:
+            raise SearchError("search_failed", "Filename search failed", {"status": return_code, "stderr": diagnostics})
+    else:
+        arguments = [find_tool("rg"), "--json", "--line-number", "--fixed-strings"]
+        for extension in extensions:
+            suffix = "".join(f"[{letter.lower()}{letter.upper()}]" if letter.isalpha() else letter for letter in extension)
+            arguments.extend(("--glob", f"*.{suffix}"))
+        for skip in excludes:
+            # The leading **/ is load-bearing: the search root is absolute, and
+            # a root-relative glob matches nothing against an absolute path.
+            arguments.extend(("--glob", f"!**/{skip}/**"))
+        arguments.extend(("--", query, *targets))
+        parser = ContentsParser(root, results, deadline)
+        return_code, diagnostics, stopped = run_tool(arguments, parser, deadline)
+        if not stopped and return_code not in (0, 1):
+            raise SearchError("search_failed", "Contents search failed", {"status": return_code, "stderr": diagnostics})
+    return results.record()
+
+
+def main():
+    try:
+        request = read_request()
+        if request.get("type") == "wire/describe":
+            emit({"type": "result", "value": descriptor()})
+            return 0
+        payload = request_payload(request)
+        if payload.get("op") == "scopes":
+            result = {"scopes": available_scopes(), "default": DEFAULT_SCOPE, "defaultRoot": str(Path.home() / "Documents/GitHub")}
+            emit({"type": "result", "value": result})
+            return 0
+        if payload.get("op") == "chooseFolder":
+            emit({"type": "result", "value": choose_folder()})
+            return 0
+        if payload.get("op") == "reveal":
+            emit({"type": "result", "value": reveal_file(payload)})
+            return 0
+        scope_key, root, excludes, query, mode, extensions = parse_search_request(request)
+        targets = [str(root)]
+        status = "Scanning names" if mode == "name" else "Scanning contents"
+        if mode == "contents" and (scope_key in CLOUD_SCOPES or is_cloud_root(root)):
+            targets, skipped = local_files(root)
+            suffixes = tuple(f".{extension.lower()}" for extension in extensions)
+            excluded_roots = [root / relative for relative in excludes]
+            targets = [
+                path for path in targets
+                if (not suffixes or path.lower().endswith(suffixes))
+                and not any(Path(path).is_relative_to(excluded) for excluded in excluded_roots)
+            ]
+            if not targets:
+                emit({"type": "result", "value": {"root": str(root), "matches": [], "truncated": False, "skippedNotDownloaded": skipped}})
+                return 0
+            if skipped:
+                status = f"Searching {len(targets)} downloaded files, skipping {skipped} not on this Mac"
+        emit({"type": "status", "text": status})
+        record = search(root, excludes, targets, query, mode, extensions)
+        sys.stdout.buffer.write(record + b"\n")
+        sys.stdout.buffer.flush()
+        return 0
+    except SearchError as error:
+        emit_error(error)
+        return 0
+    except BrokenPipeError:
+        return 1
+    except Exception as error:
+        print(f"clay-search: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
