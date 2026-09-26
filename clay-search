@@ -244,15 +244,13 @@ def parse_search_request(request):
 
 
 SCOPES = (
-    ("github", "GitHub", "Documents/GitHub"),
-    ("hyperclay", "Hyperclay", "Documents/GitHub/hyper/hyperclay"),
-    ("plans", "Plans", "Documents/GitHub/hyper/plans"),
+    ("home", "Home", ""),
     ("documents", "Documents", "Documents"),
+    ("desktop", "Desktop", "Desktop"),
     ("downloads", "Downloads", "Downloads"),
-    ("dropbox", "Dropbox Current", "Library/CloudStorage/Dropbox/_Current"),
-    ("polsia", "Polsia research", "Documents/GitHub/polsia/polsia-research"),
+    ("dropbox", "Dropbox", "Library/CloudStorage/Dropbox"),
 )
-DEFAULT_SCOPE = "github"
+DEFAULT_SCOPE = "documents"
 
 # Folders a sync client fills on demand. Reading a placeholder makes it download
 # the file, so a contents search over one of these pulls the whole folder down
@@ -262,11 +260,9 @@ SF_DATALESS = 0x40000000
 LOCAL_LIST_BYTES = 800 << 10
 LOCAL_LIST_COUNT = 20000
 
-# polsia-research holds 695k of the 805k files under Documents/GitHub, which is
-# the difference between a 3 second search and a 33 second one. It is skipped
-# everywhere rather than searched, and reachable as its own scope rather than
-# hidden, so nothing is silently missing.
-EXCLUDED = ("Documents/GitHub/polsia/polsia-research",)
+# Folders under a scope that every search skips, relative to the home folder.
+# Selecting one directly as the folder still searches it.
+EXCLUDED = ()
 
 
 def scope_table():
@@ -766,7 +762,7 @@ def main():
             return 0
         payload = request_payload(request)
         if payload.get("op") == "scopes":
-            result = {"scopes": available_scopes(), "default": DEFAULT_SCOPE, "defaultRoot": str(Path.home() / "Documents/GitHub")}
+            result = {"scopes": available_scopes(), "default": DEFAULT_SCOPE, "defaultRoot": str(Path.home() / "Documents")}
             emit({"type": "result", "value": result})
             return 0
         if payload.get("op") == "chooseFolder":

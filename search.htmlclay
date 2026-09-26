@@ -857,7 +857,7 @@
 
           <label class="field">
             <span class="field-label">Shortcuts</span>
-            <select id="scope"><option value="">Custom folder</option><option value="github">GitHub</option><option value="hyperclay">Hyperclay</option><option value="plans">Plans</option><option value="documents">Documents</option><option value="downloads">Downloads</option><option value="dropbox">Dropbox Current</option><option value="polsia">Polsia research</option></select>
+            <select id="scope"><option value="">Custom folder</option><option value="home">Home</option><option value="documents">Documents</option><option value="desktop">Desktop</option><option value="downloads">Downloads</option><option value="dropbox">Dropbox</option></select>
           </label>
 
           <div class="field folder-field">
@@ -876,11 +876,11 @@
     <section class="results-shell" id="results" clay="no-snapshot" aria-live="polite" aria-busy="false"></section>
   </main>
 
-  <script src="clay/clay.js?plugins=wire,sync"></script>
+  <script src="https://clayjs.com/v1/clay.js?plugins=wire,sync"></script>
   <script>
     (() => {
       // Long enough that typing a word does not fire a search per keystroke on a
-      // scope the size of GitHub, short enough to still feel live on a small one.
+      // scope the size of a whole home folder, short enough to still feel live on a small one.
       // Enter bypasses it entirely.
       const SEARCH_DEBOUNCE_MS = 1000;
 
