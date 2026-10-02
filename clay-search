@@ -189,6 +189,11 @@ def file_extensions(payload):
     return (extension.lower(),)
 
 
+MACOS = sys.platform == "darwin"
+FILE_MANAGER = "Finder" if MACOS else "Files"
+TOOL_ALIASES = {"fd": ("fdfind",)}
+
+
 def is_cloud_root(root):
     cloud_roots = [Path.home() / "Library/CloudStorage", Path.home() / "Library/Mobile Documents", Path.home() / "Dropbox"]
     for path in cloud_roots:
@@ -202,6 +207,29 @@ def is_cloud_root(root):
 
 
 def choose_folder():
+    if MACOS:
+        return choose_folder_macos()
+    pickers = (
+        ["zenity", "--file-selection", "--directory", "--title=Choose a folder to search"],
+        ["kdialog", "--getexistingdirectory", str(Path.home()), "--title", "Choose a folder to search"],
+    )
+    for command in pickers:
+        if shutil.which(command[0]) is None:
+            continue
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired):
+            raise SearchError("folder_picker_failed", "The folder picker could not complete") from None
+        chosen = result.stdout.rstrip("\n")
+        if result.returncode == 1 and not chosen:
+            return {"cancelled": True}
+        if result.returncode or not chosen:
+            raise SearchError("folder_picker_failed", "The folder picker could not open")
+        return {"root": str(resolve_root(chosen)), "cancelled": False}
+    raise SearchError("folder_picker_failed", "Install zenity or kdialog to choose a folder, or type the path")
+
+
+def choose_folder_macos():
     script = 'activate me\nPOSIX path of (choose folder with prompt "Choose a folder to search")'
     try:
         result = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, text=True, timeout=120)
@@ -224,10 +252,26 @@ def reveal_file(payload):
         raise SearchError("file_unavailable", "That file no longer exists")
     resolved, _ = confined
     try:
-        subprocess.run(["/usr/bin/open", "-R", str(resolved)], check=True, capture_output=True, timeout=10)
+        show_in_file_manager(resolved)
     except (OSError, subprocess.SubprocessError):
-        raise SearchError("reveal_failed", "Finder could not reveal that file") from None
+        raise SearchError("reveal_failed", f"{FILE_MANAGER} could not show that file") from None
     return {"revealed": True}
+
+
+def show_in_file_manager(path):
+    if MACOS:
+        subprocess.run(["/usr/bin/open", "-R", str(path)], check=True, capture_output=True, timeout=10)
+        return
+    if shutil.which("gdbus"):
+        result = subprocess.run(
+            ["gdbus", "call", "--session", "--dest", "org.freedesktop.FileManager1",
+             "--object-path", "/org/freedesktop/FileManager1",
+             "--method", "org.freedesktop.FileManager1.ShowItems", f"['{path.as_uri()}']", ""],
+            capture_output=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return
+    subprocess.run(["xdg-open", str(path.parent)], check=True, capture_output=True, timeout=10)
 
 
 def parse_search_request(request):
@@ -248,7 +292,7 @@ SCOPES = (
     ("documents", "Documents", "Documents"),
     ("desktop", "Desktop", "Desktop"),
     ("downloads", "Downloads", "Downloads"),
-    ("dropbox", "Dropbox", "Library/CloudStorage/Dropbox"),
+    ("dropbox", "Dropbox", "Library/CloudStorage/Dropbox" if sys.platform == "darwin" else "Dropbox"),
 )
 DEFAULT_SCOPE = "documents"
 
@@ -316,7 +360,7 @@ def available_scopes():
 
 
 def local_files(root):
-    """The files under a cloud folder that are already on this Mac.
+    """The files under a cloud folder that are already on this computer.
 
     macOS marks a not yet downloaded placeholder with SF_DATALESS. That flag is
     the one to trust: st_blocks agrees on all but a handful of files, and the
@@ -336,7 +380,7 @@ def local_files(root):
                 continue
             if not stat.S_ISREG(info.st_mode):
                 continue
-            if info.st_flags & SF_DATALESS:
+            if getattr(info, "st_flags", 0) & SF_DATALESS:
                 skipped += 1
                 continue
             if len(kept) >= LOCAL_LIST_COUNT or used + len(path) + 1 > LOCAL_LIST_BYTES:
@@ -348,10 +392,11 @@ def local_files(root):
 
 
 def find_tool(name):
-    path = shutil.which(name)
-    if path is None:
-        raise SearchError("tool_unavailable", f"{name} is not installed", {"tool": name})
-    return str(Path(path).resolve())
+    for candidate in (name, *TOOL_ALIASES.get(name, ())):
+        path = shutil.which(candidate)
+        if path is not None:
+            return str(Path(path).resolve())
+    raise SearchError("tool_unavailable", f"{name} is not installed", {"tool": name})
 
 
 def decoded_rg_value(value):
@@ -762,7 +807,7 @@ def main():
             return 0
         payload = request_payload(request)
         if payload.get("op") == "scopes":
-            result = {"scopes": available_scopes(), "default": DEFAULT_SCOPE, "defaultRoot": str(Path.home() / "Documents")}
+            result = {"scopes": available_scopes(), "default": DEFAULT_SCOPE, "defaultRoot": str(Path.home() / "Documents"), "fileManager": FILE_MANAGER}
             emit({"type": "result", "value": result})
             return 0
         if payload.get("op") == "chooseFolder":
@@ -787,7 +832,7 @@ def main():
                 emit({"type": "result", "value": {"root": str(root), "matches": [], "truncated": False, "skippedNotDownloaded": skipped}})
                 return 0
             if skipped:
-                status = f"Searching {len(targets)} downloaded files, skipping {skipped} not on this Mac"
+                status = f"Searching {len(targets)} downloaded files, skipping {skipped} not on this computer"
         emit({"type": "status", "text": status})
         record = search(root, excludes, targets, query, mode, extensions)
         sys.stdout.buffer.write(record + b"\n")

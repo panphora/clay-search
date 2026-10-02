@@ -901,6 +901,7 @@
         activeCall: null,
         debounceTimer: null,
         scopes: [],
+        fileManager: "Finder",
         generation: 0,
         resultItems: [],
         activeIndex: -1,
@@ -910,9 +911,9 @@
 
       const copy = {
         unknown_scope: "Pick a location from Shortcuts or enter a folder path.",
-        scope_unavailable: "That folder is not on this Mac.",
+        scope_unavailable: "That folder is not on this computer.",
         folder_picker_failed: "The folder picker could not open. Type the path instead.",
-        reveal_failed: "Finder could not reveal that file.",
+        reveal_failed: "The file manager could not show that file.",
         tool_unavailable: "Install ripgrep and fd, then search again.",
         invalid_request: "Check the query and filters.",
         unsupported_operation: "The search helper does not support this request.",
@@ -987,7 +988,7 @@
         // Reloading the tab is the one thing that cannot fix this: a reload takes
         // the same route that failed to attach the helper. Opening the document
         // itself is a different path, and it is the one that attaches it.
-        stateCard("notice", "!", "Search is not available", "Open this file from Finder to set it up, or allow Search in HTML Clay's Programs menu. Reloading this tab will not help.");
+        stateCard("notice", "!", "Search is not available", "Open this file in HTML Clay to set it up, or allow Search in HTML Clay's Programs menu. Reloading this tab will not help.");
       }
 
       function renderLoading(status) {
@@ -1079,12 +1080,12 @@
       }
 
       function attachReveal(node, path, root) {
-        node.title = "Reveal in Finder";
+        node.title = `Reveal in ${state.fileManager}`;
         const reveal = async () => {
           actionStatus.textContent = "";
           try {
             await helperAction({ op: "reveal", root, path });
-            actionStatus.textContent = "Revealed in Finder.";
+            actionStatus.textContent = `Revealed in ${state.fileManager}.`;
           } catch (error) {
             actionStatus.textContent = error.message;
           }
@@ -1153,7 +1154,7 @@
           const fileWord = fileCount === 1 ? "file" : "files";
           count.textContent = `${matchCount} ${matchWord} in ${fileCount} ${fileWord}`;
         }
-        meta.append(count, element("div", "navigation-hint", "↑ ↓ to move · Enter to reveal in Finder"));
+        meta.append(count, element("div", "navigation-hint", `↑ ↓ to move · Enter to reveal in ${state.fileManager}`));
         return meta;
       }
 
@@ -1334,6 +1335,7 @@
             throw new Error("The search helper needs to be updated.");
           }
           state.scopes = result.scopes;
+          if (typeof result.fileManager === "string") state.fileManager = result.fileManager;
           scopeSelect.replaceChildren();
           const custom = document.createElement("option");
           custom.value = "";

@@ -1,21 +1,29 @@
 # Search
 
-A file search page for macOS that runs in [HTML Clay](https://htmlclay.com). Type a word and it lists every file under a folder that contains it, or pick a file type and it lists matching filenames. Click a result to reveal it in Finder.
+A file search page for macOS and Linux that runs in [HTML Clay](https://htmlclay.com). Type a word and it lists every file under a folder that contains it, or pick a file type and it lists matching filenames. Click a result to reveal it in Finder or your file manager.
 
 The page is one HTML file. The searching is done by a small Python program beside it, `clay-search`, which the page reaches through HTML Clay's document programs. It uses [ripgrep](https://github.com/BurntSushi/ripgrep) for contents and [fd](https://github.com/sharkdp/fd) for filenames.
 
 ## Requirements
 
-- macOS
+- macOS, or Linux (tested on Ubuntu)
 - [HTML Clay](https://htmlclay.com) 1.10 or later
-- Python 3 (`python3`), which ships with the Xcode command line tools
-- ripgrep and fd:
+- Python 3 (`python3`)
+- ripgrep and fd
+
+On macOS (Python 3 ships with the Xcode command line tools):
 
 ```sh
 brew install ripgrep fd
 ```
 
-`clay-search` finds `rg` and `fd` on your login shell's PATH. Homebrew's default location works.
+On Ubuntu, which names fd `fdfind` (clay-search finds either name); zenity gives you the folder picker:
+
+```sh
+sudo apt install ripgrep fd-find zenity
+```
+
+`clay-search` finds `rg` and `fd` on the PATH HTML Clay starts it with. Homebrew's and apt's default locations work.
 
 ## Set up
 
@@ -35,16 +43,16 @@ The page opens on your Documents folder. Later double clicks open it straight aw
 
 ## Search
 
-- **Shortcuts** jumps to Home, Documents, Desktop, Downloads or Dropbox. A location this Mac does not have shows as "(not found)".
-- **Folder** takes any absolute or `~/` path. **Choose Folder…** opens the macOS folder picker.
+- **Shortcuts** jumps to Home, Documents, Desktop, Downloads or Dropbox. A location this computer does not have shows as "(not found)".
+- **Folder** takes any absolute or `~/` path. **Choose Folder…** opens the system folder picker (zenity or kdialog on Linux).
 - **File type** narrows by kind: Images (including camera raw), Video, Audio, Documents, Spreadsheets & data, Presentations, Code, Fonts, Archives, or a custom extension. With a file type and no query, it lists matching filenames.
-- Click a result, or press Enter on a focused one, to reveal the file in Finder. The arrow keys move between results.
+- Click a result, or press Enter on a focused one, to reveal the file in Finder, or in your file manager on Linux. The arrow keys move between results.
 
-Content search reads plain text. It does not extract text from PDFs, Word documents or media. ripgrep and fd keep their usual rules, so hidden files and anything in a `.gitignore` are skipped. Large result sets are capped with a notice. In Dropbox, a contents search skips files that are not downloaded to this Mac, so it never starts a download.
+Content search reads plain text. It does not extract text from PDFs, Word documents or media. ripgrep and fd keep their usual rules, so hidden files and anything in a `.gitignore` are skipped. Large result sets are capped with a notice. On macOS, a contents search in Dropbox skips files that are not downloaded yet, so it never starts a download.
 
 The page never saves itself. Searching does not mark it unsaved, and reloading never asks to confirm.
 
-## Search a folder from Finder (optional)
+## Search a folder from Finder (optional, macOS)
 
 This adds **Search with Clay** to the Services menu when you right click a folder.
 
