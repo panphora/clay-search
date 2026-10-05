@@ -48,7 +48,7 @@ The page opens on your Documents folder. Later double clicks open it straight aw
 - **File type** narrows by kind: Images (including camera raw), Video, Audio, Documents, Spreadsheets & data, Presentations, Code, Fonts, Archives, or a custom extension. With a file type and no query, it lists matching filenames.
 - Click a result, or press Enter on a focused one, to reveal the file in Finder, or in your file manager on Linux. The arrow keys move between results.
 
-Content search reads plain text. It does not extract text from PDFs, Word documents or media. ripgrep and fd keep their usual rules, so hidden files and anything in a `.gitignore` are skipped. Large result sets are capped with a notice. On macOS, a contents search in Dropbox skips files that are not downloaded yet, so it never starts a download.
+Content search reads plain text. It does not extract text from PDFs, Word documents or media. ripgrep and fd keep their usual rules, so hidden files and anything in a `.gitignore` are skipped. Large result sets are capped with a notice. On macOS, a contents search in Dropbox skips content files that are not downloaded yet. Listing files still reads `.gitignore` and `.ignore` files, which may download those rule files if they are stored only in the cloud.
 
 The page never saves itself. Searching does not mark it unsaved, and reloading never asks to confirm.
 
@@ -81,3 +81,11 @@ The launcher also works from a terminal:
 ## License
 
 MIT No Attribution. See `LICENSE`.
+
+## Checks
+
+Run the cloud-search regression checks with real ripgrep:
+
+```sh
+python3 -m unittest discover -s . -p test_clay_search.py -v
+```

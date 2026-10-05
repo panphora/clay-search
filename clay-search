@@ -359,36 +359,43 @@ def available_scopes():
     return out
 
 
-def local_files(root):
-    """The files under a cloud folder that are already on this computer.
+def local_files(root, excludes=()):
+    """Enumerate searchable paths before filtering out cloud placeholders."""
+    class DownloadedFiles:
+        def __init__(self):
+            self.paths = []
+            self.skipped = 0
+            self.used = 0
 
-    macOS marks a not yet downloaded placeholder with SF_DATALESS. That flag is
-    the one to trust: st_blocks agrees on all but a handful of files, and the
-    handful is the point of checking. Returns the paths to search and how many
-    were left out, so the page can say what it skipped instead of quietly
-    returning less than the folder holds.
-    """
-    kept = []
-    skipped = 0
-    used = 0
-    for base, _, names in os.walk(root):
-        for name in names:
-            path = os.path.join(base, name)
+        def add(self, hit):
+            path = str(root / hit["path"])
             try:
                 info = os.lstat(path)
             except OSError:
-                continue
+                return True
             if not stat.S_ISREG(info.st_mode):
-                continue
+                return True
             if getattr(info, "st_flags", 0) & SF_DATALESS:
-                skipped += 1
-                continue
-            if len(kept) >= LOCAL_LIST_COUNT or used + len(path) + 1 > LOCAL_LIST_BYTES:
-                skipped += 1
-                continue
-            kept.append(path)
-            used += len(path) + 1
-    return kept, skipped
+                self.skipped += 1
+                return True
+            size = len(os.fsencode(path)) + 1
+            if len(self.paths) >= LOCAL_LIST_COUNT or self.used + size > LOCAL_LIST_BYTES:
+                self.skipped += 1
+                return True
+            self.paths.append(path)
+            self.used += size
+            return True
+
+    files = DownloadedFiles()
+    arguments = [find_tool("rg"), "--files", "--null"]
+    for skip in excludes:
+        arguments.extend(("--glob", f"!**/{skip}/**"))
+    arguments.extend(("--", str(root)))
+    parser = NameParser(root, files)
+    return_code, diagnostics, _ = run_tool(arguments, parser, time.monotonic() + TOOL_TIMEOUT_SECONDS)
+    if return_code not in (0, 1):
+        raise SearchError("search_failed", "File enumeration failed", {"status": return_code, "stderr": diagnostics})
+    return files.paths, files.skipped
 
 
 def find_tool(name):
@@ -820,7 +827,7 @@ def main():
         targets = [str(root)]
         status = "Scanning names" if mode == "name" else "Scanning contents"
         if mode == "contents" and (scope_key in CLOUD_SCOPES or is_cloud_root(root)):
-            targets, skipped = local_files(root)
+            targets, skipped = local_files(root, excludes)
             suffixes = tuple(f".{extension.lower()}" for extension in extensions)
             excluded_roots = [root / relative for relative in excludes]
             targets = [
